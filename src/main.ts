@@ -1,99 +1,126 @@
-import {App, Editor, MarkdownView, Modal, Notice, Plugin} from 'obsidian';
-import {DEFAULT_SETTINGS, MyPluginSettings, SampleSettingTab} from "./settings";
+import { Notice, normalizePath, Plugin, requestUrl, TFile } from "obsidian";
+import { createI18n } from "./i18n";
+import { parseFeedXml } from "./feed";
+import { buildDailyMarkdown } from "./markdown";
+import { DEFAULT_SETTINGS, type ZotWatchSettings, ZotWatchSettingTab } from "./settings";
+import { ensureFolderExists, upsertMarkdownFile } from "./vault";
 
-// Remember to rename these classes and interfaces!
-
-export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
+/**
+ * Obsidian plugin that fetches papers from an RSS/Atom feed and writes a daily Markdown note.
+ */
+export default class ZotWatchDailyPapersPlugin extends Plugin {
+	settings: ZotWatchSettings;
 
 	async onload() {
 		await this.loadSettings();
 
-		// This creates an icon in the left ribbon.
-		this.addRibbonIcon('dice', 'Sample', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
-		});
+		const { t } = createI18n(this.settings.language);
 
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status bar text');
-
-		// This adds a simple command that can be triggered anywhere
 		this.addCommand({
-			id: 'open-modal-simple',
-			name: 'Open modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
-			}
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'replace-selected',
-			name: 'Replace selected content',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				editor.replaceSelection('Sample editor command');
-			}
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-modal-complex',
-			name: 'Open modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
-
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
-				}
-				return false;
-			}
+			id: "zotwatch-fetch-daily-papers",
+			name: t("command.fetchDailyPapers"),
+			callback: async () => {
+				await this.fetchAndWriteDailyPapers({ openAfterCreate: this.settings.openAfterCreate });
+			},
 		});
 
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
+		this.addSettingTab(new ZotWatchSettingTab(this.app, this));
 
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			new Notice("Click");
-		});
-
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
-
+		if (this.settings.fetchOnStartup) {
+			const timeoutId = window.setTimeout(() => {
+				void this.fetchAndWriteDailyPapers({ openAfterCreate: false, silent: true });
+			}, 1200);
+			this.register(() => window.clearTimeout(timeoutId));
+		}
 	}
 
-	onunload() {
-	}
+	onunload() {}
 
 	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as Partial<MyPluginSettings>);
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, (await this.loadData()) as Partial<ZotWatchSettings>);
 	}
 
 	async saveSettings() {
 		await this.saveData(this.settings);
 	}
+
+	/**
+	 * Fetches the configured feed, converts items into Markdown, and writes it into the vault.
+	 */
+	private async fetchAndWriteDailyPapers(options?: { openAfterCreate?: boolean; silent?: boolean }) {
+		const openAfterCreate = options?.openAfterCreate ?? false;
+		const silent = options?.silent ?? false;
+
+		const { t } = createI18n(this.settings.language);
+
+		const { feedUrl } = this.settings;
+		if (!feedUrl) {
+			new Notice(t("notice.missingFeedUrl"));
+			return;
+		}
+
+		try {
+			if (!silent) new Notice(t("notice.fetchingFeed"));
+
+			const response = await requestUrl({ url: feedUrl });
+			const allItems = parseFeedXml(response.text);
+			const items =
+				this.settings.recommendedCount === "all"
+					? allItems
+					: allItems.slice(0, this.settings.recommendedCount);
+
+			if (items.length === 0) {
+				new Notice(t("notice.noItemsParsed"));
+				return;
+			}
+
+			const today = formatLocalDate(new Date());
+			const folderPath = normalizePath(this.settings.outputFolder || "ZotWatch");
+			await ensureFolderExists(this.app.vault, folderPath);
+
+			const baseName = (this.settings.fileNameTemplate || "Daily papers {{date}}")
+				.replace(/\{\{date\}\}/g, today)
+				.trim();
+			const fileName = baseName.length > 0 ? baseName : `Daily papers ${today}`;
+
+			const targetPathBase = normalizePath(`${folderPath}/${fileName}.md`);
+			const markdown = buildDailyMarkdown({
+				date: today,
+				sourceUrl: feedUrl,
+				items,
+				fields: this.settings.paperFields,
+				t,
+			});
+
+			const { path: targetPath, createdOrModified } = await upsertMarkdownFile(
+				this.app,
+				targetPathBase,
+				markdown,
+				this.settings.conflictPolicy,
+			);
+
+			if (!silent) {
+				if (createdOrModified === "created") new Notice(t("notice.created"));
+				else if (createdOrModified === "modified") new Notice(t("notice.updated"));
+				else new Notice(t("notice.skipped"));
+			}
+
+			if (openAfterCreate && createdOrModified !== "skipped") {
+				const file = this.app.vault.getAbstractFileByPath(targetPath);
+				if (file instanceof TFile) {
+					await this.app.workspace.getLeaf(true).openFile(file);
+				}
+			}
+		} catch (error) {
+			console.error(error);
+			new Notice(t("notice.failed"));
+		}
+	}
 }
 
-class SampleModal extends Modal {
-	constructor(app: App) {
-		super(app);
-	}
-
-	onOpen() {
-		let {contentEl} = this;
-		contentEl.setText('Woah!');
-	}
-
-	onClose() {
-		const {contentEl} = this;
-		contentEl.empty();
-	}
+function formatLocalDate(date: Date): string {
+	const yyyy = date.getFullYear();
+	const mm = String(date.getMonth() + 1).padStart(2, "0");
+	const dd = String(date.getDate()).padStart(2, "0");
+	return `${yyyy}-${mm}-${dd}`;
 }
